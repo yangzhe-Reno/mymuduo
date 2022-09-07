@@ -1,4 +1,19 @@
 # mymuduo
+以下是我对muduo库学习经验的总结：
+muduo库的学习应该采用自底向上的思路，具体步骤如下：
+- 学习基本Reactor模型如何实现
+      - 各个类的作用和互相之间的调用关系
+      - 为其他类提供了哪些API
+- 主从Reactor模型如何实现 
+      - 线程池如何实现
+      - 线程之间有哪些互斥和同步操作 
+      - 主线程如何唤醒子线程
+- TCP三个关键事件，即连接事件，读事件，写事件的处理逻辑
+     - 什么时候调用了基本Reactor模型提供的API
+     - 读写缓冲区的设计
+
+初学者可参考陈硕的实现网络库步骤：  https://github.com/chenshuo/recipes/tree/master/reactor
+
 ## muduo库核心机制分析
 ### (1)Reactor模型的实现
 #### 1.Reactor模型基础
