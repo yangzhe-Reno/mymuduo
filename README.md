@@ -21,7 +21,7 @@ muduo库的学习应该采用自底向上的思路，具体步骤如下：
 #### 1.Reactor模型基础
 重要组件：Event事件、Reactor反应堆、Demultiplex事件分发器、Evanthandler事件处理器
 
-模型图：
+模型图：![Alt](reactor.png)
 
 #### 2.muduo中Reactor模型的实现
 在muduo中，EventLoop作为反应堆，EpollPoller作为事件分发器（基于epoll封装），Channel作为事件处理器。
