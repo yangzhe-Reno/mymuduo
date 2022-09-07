@@ -213,3 +213,131 @@ void EventLoop::wakeup()
 }
 ```
 所以连起来看，当主线程如何唤醒子线程？即在主线程中，通过getNextLoop()函数获得子线程的loop对象，再在主线程中loop->queueInLoop(f)，如果此时子线程被阻塞将会触发wakeuo()，子线程被唤醒后，将会执行主线程传递的函数f。
+
+### (4) Tcp连接事件如何处理
+muduo库中，创建了TcpServer类作为用户使用muduo的核心接口,并创建了acceptor_和threadPool_两个和连接处理有关的成员变量。
+```
+    std::unique_ptr<Acceptor> acceptor_; // 运行在mainLoop，任务就是监听新连接事件
+    std::shared_ptr<EventLoopThreadPool> threadPool_; // one loop per thread
+```
+TcpServer的启动流程：
+
+- TcpServer对象server创建，将会同时创建acceptor_和threadPool_代码如下：
+```
+TcpServer::TcpServer(EventLoop *loop,
+                const InetAddress &listenAddr,
+                const std::string &nameArg,
+                Option option)
+...
+                , acceptor_(new Acceptor(loop, listenAddr, option == kReusePort))
+                , threadPool_(new EventLoopThreadPool(loop, name_))
+...
+{
+    // 当有先用户连接时，会执行TcpServer::newConnection回调
+    acceptor_->setNewConnectionCallback(std::bind(&TcpServer::newConnection, this, 
+        std::placeholders::_1, std::placeholders::_2));
+}
+
+```
+- 调用Acceptor构造函数时，将会创建acceptChannel_对象，设置读回调函数Acceptor::handleRead，此时acceptChannel_还没有注册读事件。
+```
+Acceptor::Acceptor(EventLoop *loop, const InetAddress &listenAddr, bool reuseport)
+    : loop_(loop)
+    , acceptSocket_(createNonblocking()) // socket
+    , acceptChannel_(loop, acceptSocket_.fd())
+    , listenning_(false)
+{
+    acceptSocket_.setReuseAddr(true);
+    acceptSocket_.setReusePort(true);
+    acceptSocket_.bindAddress(listenAddr); // bind
+    acceptChannel_.setReadCallback(std::bind(&Acceptor::handleRead, this));
+}
+```
+- 直到调用server.start(),通过loop_->runInLoop(std::bind(&Acceptor::listen, acceptor_.get())); 主线程调用Acceptor::listen函数执行
+```
+void TcpServer::start()
+{
+    if (started_++ == 0) // 防止一个TcpServer对象被start多次
+    {
+        threadPool_->start(threadInitCallback_); // 启动底层的loop线程池
+        loop_->runInLoop(std::bind(&Acceptor::listen, acceptor_.get()));
+    }
+}
+```
+- 直到listen()执行时，acceptChannel_.enableReading()，acceptChannel_才注册读事件。
+```
+void Acceptor::listen()
+{
+    listenning_ = true;
+    acceptSocket_.listen(); // listen
+    acceptChannel_.enableReading(); // acceptChannel_ => Poller
+}
+```
+- 当新连接到来时，acceptChannel_上触发读事件回调函数，开始执行Acceptor构造函数注册的回到函数Acceptor::handleRead()，并调用 newConnectionCallback_，该回调函数在TcpServer类构造时设置，即为TcpServer::newConnection。
+```
+void Acceptor::handleRead()
+{
+    InetAddress peerAddr;
+    int connfd = acceptSocket_.accept(&peerAddr);
+    if (connfd >= 0)
+    {
+        if (newConnectionCallback_)
+        {
+            newConnectionCallback_(connfd, peerAddr); // 轮询找到subLoop，唤醒，分发当前的新客户端的Channel
+        }
+        else
+        {
+            ::close(connfd);
+        }
+    }
+    else
+    {
+        LOG_ERROR("%s:%s:%d accept err:%d \n", __FILE__, __FUNCTION__, __LINE__, errno);
+        if (errno == EMFILE)
+        {
+            LOG_ERROR("%s:%s:%d sockfd reached limit! \n", __FILE__, __FUNCTION__, __LINE__);
+        }
+    }
+}
+```
+- 真正的处理新连接的函数TcpServer::newConnection开始执行，关键代码如下：
+```
+void TcpServer::newConnection(int sockfd, const InetAddress &peerAddr)
+{
+
+    EventLoop *ioLoop = threadPool_->getNextLoop(); 
+...
+    InetAddress localAddr(local);
+
+    // 根据连接成功的sockfd，创建TcpConnection连接对象
+    TcpConnectionPtr conn(new TcpConnection(
+                            ioLoop,
+                            connName,
+                            sockfd,   // Socket Channel
+                            localAddr,
+                            peerAddr));
+    connections_[connName] = conn;
+    // 下面的回调都是用户设置给TcpServer=>TcpConnection=>Channel=>Poller=>notify channel调用回调
+    conn->setConnectionCallback(connectionCallback_);
+    conn->setMessageCallback(messageCallback_);
+    conn->setWriteCompleteCallback(writeCompleteCallback_);
+
+    // 设置了如何关闭连接的回调   conn->shutDown()
+    conn->setCloseCallback(
+        std::bind(&TcpServer::removeConnection, this, std::placeholders::_1)
+    );
+
+    // 直接调用TcpConnection::connectEstablished
+    ioLoop->runInLoop(std::bind(&TcpConnection::connectEstablished, conn));
+}
+```
+- 子线程被通过ioLoop->runInLoop(std::bind(&TcpConnection::connectEstablished, conn));唤醒，并执行TcpConnection::connectEstablished，通过 channel_->enableReading(); 将读事件注册到子线程的loop对象中，到此连接处理结束。
+```
+void TcpConnection::connectEstablished()
+{
+    setState(kConnected);
+    channel_->tie(shared_from_this());
+    channel_->enableReading(); 
+    connectionCallback_(shared_from_this());
+}
+```
